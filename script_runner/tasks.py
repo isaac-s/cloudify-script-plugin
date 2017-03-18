@@ -280,7 +280,7 @@ def download_resource(download_resource_func, script_path):
     schema = split[0]
     if schema in ['http', 'https']:
         response = requests.get(script_path)
-        if response.status_code != 200:
+        if response.status_code != requests.codes.ok:
             raise NonRecoverableError('Failed downloading script: {0} ('
                                       'status code: {1})'
                                       .format(script_path,

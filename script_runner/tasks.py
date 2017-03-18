@@ -29,6 +29,8 @@ from cloudify import ctx as operation_ctx
 from cloudify.workflows import ctx as workflows_ctx
 from cloudify.decorators import operation, workflow
 from cloudify.exceptions import NonRecoverableError
+from cloudify.manager import get_rest_client
+from cloudify_rest_client.executions import Execution
 
 from script_runner import eval_env
 from script_runner import constants
@@ -59,6 +61,8 @@ UNSUPPORTED_SCRIPT_FEATURE_ERROR = \
 
 IS_WINDOWS = os.name == 'nt'
 
+DEFAULT_POLL_INTERVAL = 0.1
+DEFAULT_CANCEL_POLL_INTERVAL = 100
 
 @operation
 def run(script_path, process=None, **kwargs):
@@ -186,6 +190,8 @@ def execute(script_path, ctx, process):
     env[CTX_SOCKET_URL] = proxy.socket_url
 
     cwd = process.get('cwd')
+    poll_interval = process.get('poll_interval', DEFAULT_POLL_INTERVAL)
+    cancel_poll_interval = process.get('cancel_poll_interval', DEFAULT_CANCEL_POLL_INTERVAL)
 
     command_prefix = process.get('command_prefix')
     if command_prefix:
@@ -213,12 +219,64 @@ def execute(script_path, ctx, process):
     stdout_consumer = OutputConsumer(process.stdout)
     stderr_consumer = OutputConsumer(process.stderr)
 
+    cancel_poll_counter = 0
+    terminate_requested = False
+    kill_requested = False
+
     while True:
         process_ctx_request(proxy)
         return_code = process.poll()
         if return_code is not None:
             break
-        time.sleep(0.1)
+        # Cancellation support is irrelevant for local executions.
+        if not ctx._local:
+            cancel_poll_counter += 1
+            if cancel_poll_counter == cancel_poll_interval:
+                # Check for cancellation request
+                rest_client = get_rest_client()
+
+                try:
+                    execution_info = rest_client.executions.get(ctx.execution_id,
+                                                                _include=['status'])
+                except Exception as e:
+                    ctx.logger.warning(
+                        'Failed to inquire for status of execution {0}: '
+                        '{1}'.format(str(e)))
+                    continue
+
+                execution_status = execution_info.status
+
+                if execution_status == Execution.CANCELLING and \
+                        not terminate_requested:
+                    ctx.logger.info('Execution {0} is in "{1}" state. '
+                                    'Signaling process to terminate...'.format(
+                        ctx.execution_id, execution_status))
+
+                    try:
+                        process.terminate()
+                    except Exception as e:
+                        ctx.logger.error('Exception raised while attempting '
+                            'to terminate process: {0}'.format(str(e)))
+
+                    terminate_requested = True
+                elif execution_status == Execution.FORCE_CANCELLING and \
+                        not kill_requested:
+                    ctx.logger.info(
+                        'Execution {0} is in "{1}" state. Killing '
+                        'process...'.format(ctx.execution_id,
+                                            execution_status))
+
+                    try:
+                        process.kill()
+                    except Exception as e:
+                        ctx.logger.error(
+                            'Exception raised while attempting '
+                            'to kill process: {0}'.format(str(e)))
+
+                    kill_requested = True
+
+                cancel_poll_counter = 0
+        time.sleep(poll_interval)
 
     proxy.close()
     stdout_consumer.join()

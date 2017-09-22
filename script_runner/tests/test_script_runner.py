@@ -15,6 +15,7 @@
 
 import json
 import tempfile
+import shutil
 import os
 from collections import namedtuple
 
@@ -559,6 +560,47 @@ if __name__ == '__main__':
         self.assertIn('RequestError', e.stderr)
         self.assertIn('nonexistent', e.stderr)
 
+    def test_tempdir_no_override(self):
+        script_path = self._create_script(
+            linux_script='''#! /bin/bash -e
+            ctx returns "`dirname $0`"
+            ''',
+            windows_script='''
+            ctx returns %~dp0
+            ''')
+
+        result = self._normpath(self._run(script_path=script_path))
+        tempdir = self._normpath(tempfile.gettempdir())
+        self.assertTrue(result.startswith(tempdir))
+        self.assertTrue(5 == len(os.path.basename(result)))
+
+    def test_tempdir_override(self):
+        script_path = self._create_script(
+            linux_script='''#! /bin/bash -e
+            ctx returns "`dirname $0`"
+            ''',
+            windows_script='''
+            ctx returns %~dp0
+            ''')
+
+        tmpdir_override = self._normpath(tempfile.mkdtemp('override'))
+        with patch.dict(os.environ, {
+                'CFY_EXEC_TEMP': tmpdir_override}):
+            result = self._normpath(self._run(script_path=script_path))
+            self.assertTrue(result.startswith(tmpdir_override))
+
+        # Only delete if test succeeded (to help troubleshooting).
+        shutil.rmtree(tmpdir_override)
+
+    def _normpath(self, path):
+        """Normalize path to behave the same way under windows and unix
+
+        The result returned by the script can be slightly different
+        than returned by tempfile.gettempdir(), but equivalent
+        (eg. trailing slashes, or case on windows).
+        """
+        return os.path.normpath(os.path.normcase(path))
+
 
 @istest
 class TestScriptRunnerUnixCtxProxy(TestScriptRunner):
@@ -640,6 +682,7 @@ class TestPowerShellConfiguration(testtools.TestCase):
     def setUp(self):
         super(TestPowerShellConfiguration, self).setUp()
         self.original_execute = tasks.execute
+        self.original_os_remove = os.remove
         self.addCleanup(self.cleanup)
         self.process = {}
 
@@ -649,10 +692,11 @@ class TestPowerShellConfiguration(testtools.TestCase):
             self.process = process
 
         tasks.execute = execute
+        os.remove = lambda p: None
 
     def mock_ctx(self, **kwargs):
         ctx = MockCloudifyContext(**kwargs)
-        ctx.download_resource = lambda s_path: s_path
+        ctx.download_resource = lambda s_path, t_path: s_path
         current_ctx.set(ctx)
         return ctx
 
@@ -681,6 +725,7 @@ class TestPowerShellConfiguration(testtools.TestCase):
 
     def cleanup(self):
         tasks.execute = self.original_execute
+        os.remove = self.original_os_remove
         current_ctx.clear()
 
 
@@ -691,6 +736,7 @@ class TestEvalPythonConfiguration(testtools.TestCase):
         self.original_eval_script = tasks.eval_script
         self.original_execute = tasks.execute
         self.original_os_chmod = os.chmod
+        self.original_os_remove = os.remove
         self.addCleanup(self.cleanup)
 
         def eval_script(script_path, ctx, process):
@@ -704,16 +750,18 @@ class TestEvalPythonConfiguration(testtools.TestCase):
         tasks.eval_script = eval_script
         tasks.execute = execute
         os.chmod = lambda p, m: None
+        os.remove = lambda p: None
 
     def cleanup(self):
         tasks.eval_script = self.original_eval_script
         tasks.execute = self.original_execute
         os.chmod = self.original_os_chmod
+        os.remove = self.original_os_remove
         current_ctx.clear()
 
     def mock_ctx(self, **kwargs):
         ctx = MockCloudifyContext(**kwargs)
-        ctx.download_resource = lambda s_path: s_path
+        ctx.download_resource = lambda s_path, t_path: s_path
         current_ctx.set(ctx)
         return ctx
 
@@ -758,7 +806,7 @@ class TestDownloadResource(testtools.TestCase):
         super(TestDownloadResource, self).setUp()
         self.status_code = 200
 
-    def _mock_requests_get(self, url):
+    def _mock_requests_get(self, url, **kwargs):
         response = namedtuple('Response', 'text status_code')
         return response(url, self.status_code)
 
@@ -791,12 +839,12 @@ class TestDownloadResource(testtools.TestCase):
     def test_blueprint_resource(self):
         test_script_path = 'my_script.py'
 
-        def mock_download_resource(script_path):
+        def mock_download_resource(script_path, target_path):
             self.assertEqual(script_path, test_script_path)
-            return script_path
+            return target_path
         result = tasks.download_resource(mock_download_resource,
                                          test_script_path)
-        self.assertEqual(result, test_script_path)
+        self.assertTrue(result.endswith(test_script_path))
 
 
 @workflow

@@ -14,31 +14,33 @@
 #    * limitations under the License.
 
 
-import json
-import subprocess
 import os
+import re
 import sys
 import time
-import threading
-from StringIO import StringIO
+import json
 import tempfile
+import threading
+import subprocess
+from contextlib import contextmanager
+
+from StringIO import StringIO
 
 import requests
 
 from cloudify import ctx as operation_ctx
+from cloudify.utils import create_temp_folder
 from cloudify.workflows import ctx as workflows_ctx
 from cloudify.decorators import operation, workflow
 from cloudify.exceptions import NonRecoverableError
-
-from script_runner import eval_env
-from script_runner import constants
 from cloudify.proxy.client import CTX_SOCKET_URL
-
-
 from cloudify.proxy.server import (UnixCtxProxy,
                                    TCPCtxProxy,
                                    HTTPCtxProxy,
                                    StubCtxProxy)
+
+from script_runner import eval_env
+from script_runner import constants
 
 try:
     import zmq  # noqa
@@ -61,23 +63,29 @@ IS_WINDOWS = os.name == 'nt'
 
 
 @operation
-def run(script_path, process=None, **kwargs):
+def run(script_path, process=None, ssl_cert_content=None, **kwargs):
     ctx = operation_ctx._get_current_object()
     if script_path is None:
         raise NonRecoverableError('Script path parameter not defined')
     process = create_process_config(process or {}, kwargs)
-    script_path = download_resource(ctx.download_resource, script_path)
+    script_path = download_resource(ctx.download_resource, script_path,
+                                    ssl_cert_content)
     os.chmod(script_path, 0755)
     script_func = get_run_script_func(script_path, process)
-    return process_execution(script_func, script_path, ctx, process)
+    script_result = process_execution(script_func, script_path, ctx, process)
+    os.remove(script_path)
+    return script_result
 
 
 @workflow
-def execute_workflow(script_path, **kwargs):
+def execute_workflow(script_path, ssl_cert_content=None, **kwargs):
     ctx = workflows_ctx._get_current_object()
     script_path = download_resource(
-        ctx.internal.handler.download_deployment_resource, script_path)
-    return process_execution(eval_script, script_path, ctx)
+        ctx.internal.handler.download_deployment_resource, script_path,
+        ssl_cert_content)
+    script_result = process_execution(eval_script, script_path, ctx)
+    os.remove(script_path)
+    return script_result
 
 
 def create_process_config(process, operation_kwargs):
@@ -275,24 +283,48 @@ def eval_script(script_path, ctx, process=None):
     execfile(script_path, eval_globals)
 
 
-def download_resource(download_resource_func, script_path):
+def _get_target_path(source):
+    # to extract a human-readable suffix from the source path, split by
+    # both backslash (to handle windows filesystem) and forward slash
+    # (to handle URLs and unix filesystem)
+    suffix = re.split(r'\\|/', source)[-1]
+    return tempfile.mktemp(suffix='-{0}'.format(suffix),
+                           dir=create_temp_folder())
+
+
+def download_resource(download_resource_func, script_path,
+                      ssl_cert_content=None):
     split = script_path.split('://')
     schema = split[0]
+    target_path = _get_target_path(script_path)
     if schema in ['http', 'https']:
-        response = requests.get(script_path)
+        with _prepare_ssl_cert(ssl_cert_content) as cert_file:
+            response = requests.get(script_path, verify=cert_file)
         if response.status_code != requests.codes.ok:
             raise NonRecoverableError('Failed downloading script: {0} ('
                                       'status code: {1})'
                                       .format(script_path,
                                               response.status_code))
         content = response.text
-        suffix = script_path.split('/')[-1]
-        script_path = tempfile.mktemp(suffix='-{0}'.format(suffix))
-        with open(script_path, 'w') as f:
+        with open(target_path, 'w') as f:
             f.write(content)
-        return script_path
+        return target_path
     else:
-        return download_resource_func(script_path)
+        return download_resource_func(script_path, target_path)
+
+
+@contextmanager
+def _prepare_ssl_cert(ssl_cert_content):
+    cert_file = None
+    if ssl_cert_content:
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            f.write(ssl_cert_content)
+            cert_file = f.name
+    try:
+        yield cert_file
+    finally:
+        if cert_file:
+            os.unlink(cert_file)
 
 
 class OutputConsumer(object):
